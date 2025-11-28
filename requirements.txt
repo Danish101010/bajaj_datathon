@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+pdf2image
+pillow
+numpy
+opencv-python-headless
+pytesseract
+pulp
+rapidfuzz
+requests
+python-multipart
+pytest
