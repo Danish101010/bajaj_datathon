@@ -123,16 +123,37 @@ def deduplicate_candidates(candidates: List[Dict], ratio_thresh: int = 88) -> Li
             )
             
             if ratio >= ratio_thresh:
-                # Check if amounts match (if both exist)
+                # Additional checks before marking as duplicate
+                
+                # Check if amounts differ significantly (> 5%)
                 candidate_amt = candidate.get('amount')
                 other_amt = other.get('amount')
                 
-                # Amounts should match (within rounding)
+                # If amounts are significantly different, don't dedupe
                 if candidate_amt is not None and other_amt is not None:
+                    diff_pct = abs(candidate_amt - other_amt) / max(candidate_amt, other_amt) * 100
+                    if diff_pct > 5:
+                        # Amounts differ by > 5%, probably different items
+                        continue
+                    
                     # Round to 2 decimal places for comparison
                     if abs(round(candidate_amt, 2) - round(other_amt, 2)) < 0.01:
-                        group.append(j)
-                        processed.add(j)
+                        # Check if on same page and close vertically
+                        if candidate.get('page') == other.get('page'):
+                            bbox1 = candidate.get('bbox', (0, 0, 0, 0))
+                            bbox2 = other.get('bbox', (0, 0, 0, 0))
+                            y1 = bbox1[1] if len(bbox1) >= 2 else 0
+                            y2 = bbox2[1] if len(bbox2) >= 2 else 0
+                            
+                            if abs(y1 - y2) < 50:
+                                # Very close vertically - likely same item
+                                group.append(j)
+                                processed.add(j)
+                            # else: Same page but far apart - different items
+                        else:
+                            # Different pages, same description and amount - likely duplicates
+                            group.append(j)
+                            processed.add(j)
                 elif candidate_amt is None and other_amt is None:
                     # Both have no amount, consider similar
                     group.append(j)

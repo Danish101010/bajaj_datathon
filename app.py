@@ -75,6 +75,8 @@ class LineItem(BaseModel):
     id: int
     description: str
     amount: Optional[float]
+    quantity: Optional[int] = None
+    rate: Optional[float] = None
     confidence: float
     page: int
 
@@ -174,7 +176,8 @@ async def extract_bill_data(request: ExtractionRequest):
         
         # Step 6: Deduplicate candidates
         logger.info("Step 6: Deduplicating candidates...")
-        deduped_candidates = deduplicate_candidates(all_candidates, ratio_thresh=88)
+        # Lower threshold from 88 to 85 to avoid over-aggressive deduplication
+        deduped_candidates = deduplicate_candidates(all_candidates, ratio_thresh=85)
         logger.info(f"After deduplication: {len(deduped_candidates)} candidate(s)")
         
         # Debug: Log candidate details
@@ -194,6 +197,14 @@ async def extract_bill_data(request: ExtractionRequest):
                     reported_total = total
                     break
         
+        # Final fallback: use sum of candidates if no reported total found
+        # This handles invoices without explicit totals
+        if reported_total is None and deduped_candidates:
+            candidates_sum = sum(c.get('amount', 0.0) or 0.0 for c in deduped_candidates)
+            if candidates_sum > 0:
+                reported_total = candidates_sum
+                logger.info(f"No reported total found, using sum of candidates: {reported_total}")
+        
         logger.info(f"Reported total: {reported_total}")
         
         # Step 8: Run ILP reconciliation
@@ -204,16 +215,25 @@ async def extract_bill_data(request: ExtractionRequest):
         # Calculate sum of all candidates
         candidates_sum = sum(c.get('amount', 0.0) or 0.0 for c in deduped_candidates)
         
-        # If reported total is much larger than candidates sum, likely partial extraction
-        # In this case, skip reported_total constraint and just select all valid candidates
-        use_reported_total = reported_total
+        # Decide whether to use reported total based on confidence
+        use_reported_total = None
         tolerance = 5.0
         
         if reported_total and candidates_sum > 0:
             deviation_ratio = abs(reported_total - candidates_sum) / reported_total
-            if deviation_ratio > 0.5:  # Deviation > 50% indicates partial extraction
-                logger.info(f"Large deviation detected ({deviation_ratio:.1%}), treating as partial extraction")
-                use_reported_total = None  # Skip total constraint, select all candidates
+            
+            if deviation_ratio <= 0.02:  # Within 2% - very close match
+                use_reported_total = reported_total
+                logger.info(f"Using reported total {reported_total} (close match: {deviation_ratio:.1%} deviation)")
+            elif deviation_ratio > 0.5:  # Deviation > 50% - likely wrong total or partial extraction
+                logger.info(f"Large deviation detected ({deviation_ratio:.1%}), ignoring reported total")
+                use_reported_total = None
+            else:  # Moderate deviation - use reported total with tolerance
+                use_reported_total = reported_total
+                tolerance = max(tolerance, abs(reported_total - candidates_sum))
+                logger.info(f"Using reported total {reported_total} with increased tolerance {tolerance}")
+        else:
+            logger.info("No valid reported total found, selecting all valid candidates")
         
         reconcile_result = ilp_reconcile(
             deduped_candidates,
@@ -306,12 +326,13 @@ def extract_reported_total(pages_images: List[np.ndarray]) -> Optional[float]:
     if not pages_images:
         return None
     
-    # Common patterns for total amount
+    # Common patterns for total amount (more specific, exclude category totals)
     total_patterns = [
-        r'(?:grand\s+)?total\s*[:\-]?\s*(?:rs\.?|₹|\$)?\s*([0-9,]+\.?\d*)',
-        r'(?:net\s+)?amount\s*[:\-]?\s*(?:rs\.?|₹|\$)?\s*([0-9,]+\.?\d*)',
+        r'(?:grand|final|invoice)\s+total\s*[:\-]?\s*(?:rs\.?|₹|\$)?\s*([0-9,]+\.?\d*)',
+        r'total\s+(?:amount|due|payable)\s*[:\-]?\s*(?:rs\.?|₹|\$)?\s*([0-9,]+\.?\d*)',
+        r'net\s+(?:total|amount)\s*[:\-]?\s*(?:rs\.?|₹|\$)?\s*([0-9,]+\.?\d*)',
         r'balance\s*due\s*[:\-]?\s*(?:rs\.?|₹|\$)?\s*([0-9,]+\.?\d*)',
-        r'(?:rs\.?|₹|\$)\s*([0-9,]+\.?\d*)\s*(?:total|grand\s+total)',
+        r'amount\s+payable\s*[:\-]?\s*(?:rs\.?|₹|\$)?\s*([0-9,]+\.?\d*)',
     ]
     
     # Check last page first (most likely location)
@@ -332,6 +353,11 @@ def extract_reported_total(pages_images: List[np.ndarray]) -> Optional[float]:
             for pattern in total_patterns:
                 matches = re.finditer(pattern, text, re.IGNORECASE)
                 for match in matches:
+                    # Skip if this is a category/sub total
+                    full_match = match.group(0).lower()
+                    if 'category' in full_match or 'sub' in full_match:
+                        continue
+                    
                     amount_str = match.group(1)
                     amount_str = amount_str.replace(',', '')
                     
@@ -356,7 +382,7 @@ def build_response(
     reported_total: Optional[float]
 ) -> Dict:
     """
-    Build structured response JSON.
+    Build structured response JSON matching problem statement format.
     
     Args:
         candidates: All deduped candidates
@@ -364,62 +390,57 @@ def build_response(
         reported_total: Reported total from document
     
     Returns:
-        Structured response dictionary
+        Structured response dictionary in required format
     """
     # Get selected candidates
     selected_ids = set(reconcile_result['selected_ids'])
     selected_candidates = [c for c in candidates if c['id'] in selected_ids]
     
-    # Group by page
+    # Group by page and format according to problem statement
     pagewise_items = {}
     for candidate in selected_candidates:
-        page = candidate.get('page', 1)
+        page = str(candidate.get('page', 1))  # Convert to string as per format
         if page not in pagewise_items:
             pagewise_items[page] = []
         
+        # Extract fields with proper defaults
+        desc = candidate.get('description') or candidate.get('desc', '')
+        amount = candidate.get('amount')
+        qty = candidate.get('quantity')
+        rate = candidate.get('rate')
+        
+        # Build item dict matching expected format
         item = {
-            'id': candidate['id'],
-            'description': candidate.get('desc', ''),
-            'amount': candidate.get('amount'),
-            'confidence': round(candidate.get('conf', 0.0), 2)
+            'item_name': desc.strip(),
+            'item_amount': round(amount, 2) if amount is not None else None,
+            'item_rate': round(rate, 2) if rate is not None else None,
+            'item_quantity': qty if qty is not None else None
         }
+        
+        # Add optional fields if available
+        if 'confidence' in candidate or 'conf' in candidate:
+            item['confidence'] = round(candidate.get('confidence') or candidate.get('conf', 0), 2)
+        
         pagewise_items[page].append(item)
+    
+    # Convert to list format for response
+    pagewise_list = [
+        {
+            'page_no': page_no,
+            'bill_items': items
+        }
+        for page_no, items in sorted(pagewise_items.items(), key=lambda x: int(x[0]))
+    ]
     
     # Calculate metrics
     total_count = len(selected_candidates)
-    reconciled_amount = reconcile_result['selected_total']
-    deviation = reconcile_result['deviation']
+    reconciled_amount = round(reconcile_result['selected_total'], 2)
     
-    # Calculate average confidence
-    avg_conf = sum(c.get('conf', 0) for c in selected_candidates) / total_count if total_count > 0 else 0
-    
-    # Determine if manual review needed
-    requires_manual_review = False
-    warnings = []
-    
-    if reported_total and deviation > 2.0:
-        requires_manual_review = True
-        warnings.append(f"Reconciled amount deviates by ${deviation:.2f} from reported total")
-    
-    if avg_conf < 80.0:
-        requires_manual_review = True
-        warnings.append(f"Average OCR confidence is low: {avg_conf:.1f}%")
-    
-    if total_count == 0:
-        requires_manual_review = True
-        warnings.append("No line items extracted")
-    
-    # Build response
+    # Build response matching problem statement format EXACTLY
     response = {
-        'pagewise_line_items': pagewise_items,
+        'pagewise_line_items': pagewise_list,
         'total_item_count': total_count,
-        'reconciled_amount': reconciled_amount,
-        'reported_total': reported_total,
-        'deviation': deviation,
-        'average_confidence': round(avg_conf, 2),
-        'requires_manual_review': requires_manual_review,
-        'warnings': warnings,
-        'reconciliation_status': reconcile_result['status']
+        'reconciled_amount': reconciled_amount
     }
     
     return response

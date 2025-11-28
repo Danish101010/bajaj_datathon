@@ -51,10 +51,10 @@ def convert_pdf_bytes_to_images(pdf_bytes: bytes, dpi: int = 300) -> List[Image.
 
 def deskew_and_illum_correction(pil_img: Image.Image) -> np.ndarray:
     """
-    Apply deskewing and illumination correction to prepare image for OCR.
+    Apply intelligent preprocessing based on image quality assessment.
     
-    For modern clean invoices, minimal processing is best.
-    Only apply preprocessing if image quality is poor.
+    For high-quality digital invoices, minimal processing is applied.
+    For low-quality scanned images, applies deskewing, contrast enhancement, and noise reduction.
     
     Args:
         pil_img: Input PIL Image
@@ -75,9 +75,179 @@ def deskew_and_illum_correction(pil_img: Image.Image) -> np.ndarray:
     if img_bgr.size == 0:
         raise ValueError("Image is empty")
     
-    # For modern digital invoices, return as-is
-    # Aggressive preprocessing (deskewing, thresholding) often damages clean text
-    return img_bgr
+    # Assess image quality
+    quality_metrics = assess_image_quality(img_bgr)
+    
+    # Apply preprocessing based on quality
+    if quality_metrics['is_high_quality']:
+        # High quality: minimal processing
+        # Only resize if too large
+        h, w = img_bgr.shape[:2]
+        max_dim = 4000
+        if max(h, w) > max_dim:
+            scale = max_dim / max(h, w)
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            img_bgr = cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        
+        return img_bgr
+    else:
+        # Low quality: apply full preprocessing pipeline
+        # 1. Deskew if needed
+        if quality_metrics['needs_deskew']:
+            img_bgr = _deskew_image(img_bgr)
+        
+        # 2. Enhance contrast
+        img_bgr = enhance_contrast(img_bgr)
+        
+        # 3. Denoise if very noisy
+        if quality_metrics['is_noisy']:
+            img_bgr = cv2.fastNlMeansDenoisingColored(img_bgr, None, 10, 10, 7, 21)
+        
+        # 4. Sharpen text
+        img_bgr = sharpen_text(img_bgr)
+        
+        return img_bgr
+
+
+def assess_image_quality(img_bgr: np.ndarray) -> dict:
+    """
+    Assess image quality to determine preprocessing strategy.
+    
+    Args:
+        img_bgr: Input BGR image
+    
+    Returns:
+        Dictionary with quality metrics
+    """
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    
+    # Calculate sharpness (Laplacian variance)
+    laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+    
+    # Calculate contrast (standard deviation)
+    contrast = gray.std()
+    
+    # Estimate noise level
+    noise_level = estimate_noise(gray)
+    
+    # Detect if image needs deskewing
+    needs_deskew = detect_skew_angle(gray) > 1.0  # More than 1 degree skew
+    
+    # High quality criteria
+    is_high_quality = (
+        laplacian_var > 100 and  # Sharp text
+        contrast > 50 and         # Good contrast
+        noise_level < 10          # Low noise
+    )
+    
+    return {
+        'is_high_quality': is_high_quality,
+        'sharpness': laplacian_var,
+        'contrast': contrast,
+        'noise_level': noise_level,
+        'needs_deskew': needs_deskew,
+        'is_noisy': noise_level > 15
+    }
+
+
+def estimate_noise(gray: np.ndarray) -> float:
+    """
+    Estimate noise level in grayscale image.
+    
+    Args:
+        gray: Grayscale image
+    
+    Returns:
+        Estimated noise level (standard deviation)
+    """
+    # Use median filter difference as noise estimate
+    blurred = cv2.medianBlur(gray, 5)
+    noise = np.abs(gray.astype(np.float32) - blurred.astype(np.float32))
+    return noise.std()
+
+
+def detect_skew_angle(gray: np.ndarray) -> float:
+    """
+    Detect skew angle in grayscale image.
+    
+    Args:
+        gray: Grayscale image
+    
+    Returns:
+        Detected skew angle in degrees
+    """
+    # Use Hough line detection to find dominant angles
+    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+    lines = cv2.HoughLines(edges, 1, np.pi / 180, 200)
+    
+    if lines is None:
+        return 0.0
+    
+    # Extract angles
+    angles = []
+    for rho, theta in lines[:, 0]:
+        angle = np.degrees(theta) - 90
+        # Normalize to [-45, 45]
+        if angle < -45:
+            angle += 90
+        elif angle > 45:
+            angle -= 90
+        angles.append(angle)
+    
+    if not angles:
+        return 0.0
+    
+    # Return median angle
+    return float(np.median(angles))
+
+
+def enhance_contrast(img_bgr: np.ndarray) -> np.ndarray:
+    """
+    Enhance image contrast using adaptive histogram equalization.
+    
+    Args:
+        img_bgr: Input BGR image
+    
+    Returns:
+        Contrast-enhanced BGR image
+    """
+    # Convert to LAB color space
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    
+    # Apply CLAHE to L channel
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l_enhanced = clahe.apply(l)
+    
+    # Merge and convert back to BGR
+    lab_enhanced = cv2.merge([l_enhanced, a, b])
+    img_enhanced = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2BGR)
+    
+    return img_enhanced
+
+
+def sharpen_text(img_bgr: np.ndarray) -> np.ndarray:
+    """
+    Sharpen text in image for better OCR.
+    
+    Args:
+        img_bgr: Input BGR image
+    
+    Returns:
+        Sharpened BGR image
+    """
+    # Create sharpening kernel
+    kernel = np.array([
+        [0, -1, 0],
+        [-1, 5, -1],
+        [0, -1, 0]
+    ], dtype=np.float32)
+    
+    # Apply sharpening
+    sharpened = cv2.filter2D(img_bgr, -1, kernel)
+    
+    return sharpened
 
 
 def _deskew_image(img_bgr: np.ndarray) -> np.ndarray:

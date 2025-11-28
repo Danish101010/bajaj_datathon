@@ -64,14 +64,23 @@ def test_extraction(
                         print(f"    - {warning}")
                 
                 print(f"\n  Line items by page:")
-                pagewise = data.get('pagewise_line_items', {})
-                for page, items in pagewise.items():
-                    print(f"\n    Page {page}: {len(items)} items")
+                pagewise = data.get('pagewise_line_items', [])
+                for page_data in pagewise:
+                    page_no = page_data.get('page_no', '1')
+                    items = page_data.get('bill_items', [])
+                    print(f"\n    Page {page_no}: {len(items)} items")
                     for item in items[:3]:  # Show first 3 items
-                        desc = item.get('description', 'N/A')[:50]
-                        amt = item.get('amount', 0)
+                        name = item.get('item_name', 'N/A')[:50]
+                        qty = item.get('item_quantity')
+                        rate = item.get('item_rate')
+                        amt = item.get('item_amount', 0)
                         conf = item.get('confidence', 0)
-                        print(f"      - {desc:50s} ${amt:>8.2f} ({conf:.1f}%)")
+                        
+                        # Format output with qty and rate if available
+                        if qty is not None and rate is not None:
+                            print(f"      - {name:40s} | qty: {qty:3} × ${rate:7.2f} = ${amt:8.2f} ({conf:.1f}%)")
+                        else:
+                            print(f"      - {name:40s} | ${amt:8.2f} ({conf:.1f}%)")
                     if len(items) > 3:
                         print(f"      ... and {len(items) - 3} more items")
             else:

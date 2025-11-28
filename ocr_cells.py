@@ -143,6 +143,11 @@ def extract_amount_from_cell_text(text: str) -> Optional[float]:
     # Take the last (typically most relevant) numeric value
     amount_str = matches[-1]
     
+    # CRITICAL FIX: Check if this looks like a unit specification (300mg, 500ml, etc.)
+    # If the original text has the numeric followed by unit letters, skip it
+    if re.search(r'\d+\s*(mg|ml|g|kg|l|lb|oz|mcg|gm|cc|iu|tab|cap|bottle|box|pack|unit)', text, re.IGNORECASE):
+        return None
+    
     # Remove commas
     amount_str = amount_str.replace(',', '')
     
